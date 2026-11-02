@@ -1,0 +1,27 @@
+version: "3"
+dotenv: [".env.local", ".env"]
+vars:
+  INDENT: 4
+
+tasks:
+  install:
+    desc: "Install dependencies"
+    cmds:
+      - "uv sync --extra dev"
+
+  dev:
+    desc: "Run the agent worker"
+    interactive: true
+    cmds:
+      - "uv run src/agent.py dev"
+
+  frontend:
+    desc: "Serve the camera demo at http://localhost:8080"
+    interactive: true
+    cmds:
+      - "uv run frontend/serve.py"
+
+  test:
+    desc: "Run the gateway unit tests"
+    cmds:
+      - "uv run pytest"

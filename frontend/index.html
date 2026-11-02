@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VLM Run × LiveKit</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: #0b0d12; color: #e8eaf0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 20px 28px; border-bottom: 1px solid #1d2230; display: flex; align-items: baseline; gap: 12px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header span { color: #8b93a7; font-size: 13px; }
+  main { display: grid; grid-template-columns: 1.2fr 1fr; gap: 20px; padding: 24px 28px; max-width: 1200px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: #10131b; border: 1px solid #1d2230; border-radius: 12px; overflow: hidden; }
+  .panel h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #8b93a7; margin: 0; padding: 12px 16px; border-bottom: 1px solid #1d2230; }
+  video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; object-fit: contain; }
+  .controls { padding: 14px 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: #2450ff; color: #fff; border: 0; border-radius: 8px; padding: 9px 16px;
+    font-size: 14px; font-weight: 500; cursor: pointer;
+  }
+  button.secondary { background: #1d2230; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { font-size: 13px; color: #8b93a7; margin-left: auto; }
+  #latest {
+    margin: 0; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+    white-space: pre-wrap; word-break: break-word; min-height: 160px; color: #7ee787;
+  }
+  #log { padding: 0 16px 16px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #8b93a7; max-height: 280px; overflow-y: auto; }
+  #log div { padding: 6px 0; border-top: 1px solid #161a26; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Live vision</h1>
+  <span>LiveKit camera → VLM Run WS /v1/ws → JSON</span>
+</header>
+<main>
+  <section class="panel">
+    <h2>Video source</h2>
+    <video id="preview" autoplay muted playsinline></video>
+    <div class="controls">
+      <button id="camBtn">Share camera</button>
+      <button id="screenBtn" class="secondary">Share screen</button>
+      <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <span id="status">disconnected</span>
+    </div>
+  </section>
+  <section class="panel">
+    <h2>Structured output</h2>
+    <pre id="latest">waiting for the agent</pre>
+    <div id="log"></div>
+  </section>
+</main>
+<script>
+const { Room, RoomEvent, createLocalVideoTrack, createLocalScreenTracks } = LivekitClient;
+
+const statusEl = document.getElementById("status");
+const latestEl = document.getElementById("latest");
+const logEl = document.getElementById("log");
+const preview = document.getElementById("preview");
+const camBtn = document.getElementById("camBtn");
+const screenBtn = document.getElementById("screenBtn");
+const stopBtn = document.getElementById("stopBtn");
+
+let room = null;
+let publishedTrack = null;
+
+async function connect() {
+  if (room) return room;
+  const res = await fetch("/token");
+  if (!res.ok) throw new Error("token failed (" + res.status + ")");
+  const { url, token } = await res.json();
+  room = new Room({ adaptiveStream: false, dynacast: false });
+  room.registerTextStreamHandler("vision", async (reader) => {
+    const text = await reader.readAll();
+    let pretty = text;
+    let latency = "";
+    try {
+      const body = JSON.parse(text);
+      latency = body._vlmrun && body._vlmrun.latency_ms != null ? body._vlmrun.latency_ms + " ms" : "";
+      pretty = JSON.stringify(body, null, 2);
+    } catch (err) {}
+    latestEl.textContent = latency ? latency + "\n\n" + pretty : pretty;
+    const entry = document.createElement("div");
+    entry.textContent = new Date().toLocaleTimeString() + (latency ? " · " + latency : "");
+    logEl.prepend(entry);
+    while (logEl.childElementCount > 40) logEl.lastChild.remove();
+  });
+  room.on(RoomEvent.Disconnected, () => { statusEl.textContent = "disconnected"; room = null; });
+  await room.connect(url, token);
+  statusEl.textContent = "connected · " + room.name;
+  return room;
+}
+
+async function publish(kind) {
+  camBtn.disabled = screenBtn.disabled = true;
+  try {
+    const connected = await connect();
+    await stopTrack();
+    if (kind === "camera") {
+      publishedTrack = await createLocalVideoTrack({
+        resolution: { width: 960, height: 540, frameRate: 30 },
+      });
+    } else {
+      const tracks = await createLocalScreenTracks({ audio: false });
+      publishedTrack = tracks.find((track) => track.kind === "video");
+    }
+    publishedTrack.contentHint = "motion";
+    await connected.localParticipant.publishTrack(publishedTrack, {
+      simulcast: false,
+      source: kind === "screen" ? LivekitClient.Track.Source.ScreenShare : LivekitClient.Track.Source.Camera,
+      videoEncoding: { maxBitrate: 1500000, maxFramerate: 30 },
+      degradationPreference: "maintainFramerate",
+      scalabilityMode: "L1T1",
+    });
+    publishedTrack.attach(preview);
+    statusEl.textContent = "publishing " + kind + " · " + connected.name;
+    stopBtn.disabled = false;
+  } catch (err) {
+    statusEl.textContent = "error: " + (err.message || err);
+  } finally {
+    camBtn.disabled = screenBtn.disabled = false;
+  }
+}
+
+async function stopTrack() {
+  if (!publishedTrack) return;
+  publishedTrack.detach();
+  if (room) await room.localParticipant.unpublishTrack(publishedTrack);
+  publishedTrack.stop();
+  publishedTrack = null;
+  stopBtn.disabled = true;
+}
+
+camBtn.onclick = () => publish("camera");
+screenBtn.onclick = () => publish("screen");
+stopBtn.onclick = () => { stopTrack(); statusEl.textContent = "connected · " + (room ? room.name : ""); };
+</script>
+</body>
+</html>
