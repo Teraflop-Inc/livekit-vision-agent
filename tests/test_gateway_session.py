@@ -105,3 +105,15 @@ async def test_send_before_open_raises():
     session = GatewaySession("ws://unused", "k", "m")
     with pytest.raises(RuntimeError, match="not open"):
         await session.send_jpeg(JPEG)
+
+
+async def test_a_frame_without_a_reply_times_out(gateway):
+    async def silent(ws, frame, data):
+        return None
+
+    gateway.reply = silent
+    session = GatewaySession(gateway.url, "k", "m", "pose")
+    await session.open()
+    with pytest.raises(TimeoutError, match="no reply"):
+        await session.send_jpeg(JPEG, timeout=0.2)
+    await session.aclose()

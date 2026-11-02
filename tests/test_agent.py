@@ -41,6 +41,7 @@ class FakeSession:
     instances: list[FakeSession] = []
     open_failures = 0
     send_failures = 0
+    stalls = 0
     drop_all = False
 
     def __init__(self, url: str, api_key: str, model: str, method: str = "", prompt: str = ""):
@@ -55,8 +56,12 @@ class FakeSession:
             FakeSession.open_failures -= 1
             raise RuntimeError("gateway unavailable")
 
-    async def send_jpeg(self, jpeg: bytes) -> dict[str, Any] | None:
+    async def send_jpeg(self, jpeg: bytes, timeout: float = 5.0) -> dict[str, Any] | None:
         self.sent.append(jpeg)
+        if FakeSession.stalls:
+            FakeSession.stalls -= 1
+            await asyncio.sleep(timeout)
+            raise TimeoutError("no reply for the frame")
         if FakeSession.send_failures:
             FakeSession.send_failures -= 1
             raise RuntimeError("connection lost")
@@ -79,6 +84,7 @@ def fake_gateway(monkeypatch):
     FakeSession.instances = []
     FakeSession.open_failures = 0
     FakeSession.send_failures = 0
+    FakeSession.stalls = 0
     FakeSession.drop_all = False
     monkeypatch.setattr(agent, "GatewaySession", FakeSession)
     monkeypatch.setattr(agent, "RETRY_S", 0.05)
@@ -311,3 +317,17 @@ async def test_failed_opens_back_off(monkeypatch):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert waits[:5] == [1.0, 2.0, 4.0, 4.0, 4.0], waits
+
+
+async def test_a_stalled_frame_reconnects_and_results_resume(monkeypatch):
+    monkeypatch.setattr(agent, "FRAME_TIMEOUT_S", 0.2)
+    FakeSession.stalls = 1
+    room = FakeRoom()
+    vision = agent.VisionAgent(room)  # type: ignore[arg-type]
+    feed = camera(vision)
+    task = await run_loop(vision)
+    await wait_for(lambda: bool(room.local_participant.texts))
+    await stop(task)
+    feed.cancel()
+    assert len(FakeSession.instances) == 2
+    assert FakeSession.instances[0].closed, "the stuck session was closed"

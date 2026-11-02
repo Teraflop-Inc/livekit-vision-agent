@@ -42,6 +42,9 @@ IDLE_CLOSE_S = 5.0
 # capacity ("capacity_error", no retry_after) isn't hammered.
 RETRY_S = 1.0
 MAX_RETRY_S = 30.0
+# A frame with no reply in this long means the session is stuck (seen live: one reply
+# took 19 s); the session is closed and reopened.
+FRAME_TIMEOUT_S = 5.0
 
 
 def _jpeg(frame: rtc.VideoFrame, max_width: int = 960) -> bytes:
@@ -181,7 +184,7 @@ class VisionAgent:
                 started = time.perf_counter()
                 try:
                     jpeg = await asyncio.to_thread(_jpeg, frame)
-                    event = await session.send_jpeg(jpeg)
+                    event = await session.send_jpeg(jpeg, timeout=FRAME_TIMEOUT_S)
                     latency_ms = round((time.perf_counter() - started) * 1000)
                     failures = 0
                     if event is not None:
