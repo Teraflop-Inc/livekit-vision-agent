@@ -1,0 +1,22 @@
+[project]
+name = "vlmrun-vision-agent"
+version = "0.1.0"
+description = "LiveKit vision agent that reads a room's camera on the VLM Run realtime gateway"
+requires-python = ">=3.10"
+dependencies = [
+    "livekit-agents>=1.0",
+    "livekit-api>=1.0",
+    "pillow>=10.0",
+    "python-dotenv>=1.0",
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
