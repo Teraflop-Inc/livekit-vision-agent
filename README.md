@@ -2,9 +2,16 @@
 
 A [LiveKit Agents](https://docs.livekit.io/agents/) worker that joins a room, watches the camera or screen that was published there, and posts what the model sees back into the room as JSON.
 
-Inference goes to the VLM Run realtime socket, `wss://gateway.vlm.run/v1/ws`. One session stays open. Each message after it opens is a single JPEG, sent as raw bytes, and the reply is the model's result for that frame.
+Inference goes to the VLM Run realtime socket, `wss://gateway.vlm.run/v1/ws`. Each message after the session opens is a single JPEG, sent as raw bytes, and the reply is the model's result for that frame. The gateway bills the seconds a session is open, so the session opens on the first camera frame and closes when the camera leaves or sends no new frame for 5 seconds.
 
 The page shows your camera immediately. The JSON panel updates when each result arrives, with the round-trip on the first line.
+
+## Test it
+
+```bash
+uv run pytest            # unit tests; the live socket tests run when VLMRUN_API_KEY is set
+uv run python e2e/room_test.py   # real LiveKit room, needs the LiveKit and VLM Run keys
+```
 
 ## Run it
 
@@ -26,11 +33,11 @@ Open http://localhost:8080 and click **Share camera** or **Share screen**.
 
 ## What the agent sends
 
-`session.create` names `VLMRUN_MODEL`. `VLMRUN_METHOD` selects the method (`pose` for ViTPose and HaMeR, `segment` for SAM). `VLMRUN_PROMPT` is the session prompt.
+`session.create` names `VLMRUN_MODEL`. `VLMRUN_METHOD` selects the method (`pose` for ViTPose and HaMeR). `VLMRUN_PROMPT` is the session prompt.
 
-The model must have a `realtime` block. A generative chat model is refused on this socket. The default is `usyd-community/vitpose-plus-large`.
+The model must stream on the socket: ViTPose (`usyd-community/vitpose-plus-large`, the default) and HaMeR (`geopavlakos/hamer`) do. A generative chat model is refused, and so is SAM (`facebook/sam3.1`). If the model is at capacity, the agent retries with a growing wait, up to 30 seconds.
 
-`VISION_FPS` is a local cap. The session also enforces the model's `max_fps`, and a frame that arrives sooner comes back as `frame.dropped`. The agent keeps only the newest frame, so a slow result never queues an old one.
+`VISION_FPS` is a local cap. The session also enforces the model's `max_fps`, and a frame that arrives sooner comes back as `frame.dropped`. The agent keeps only the newest frame and sends each frame once, so a slow result never queues an old one.
 
 Each observation is a text stream on the topic `vision`. `_vlmrun.latency_ms` is the time from encoding the frame to receiving the result.
 

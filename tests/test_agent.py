@@ -81,6 +81,7 @@ def fake_gateway(monkeypatch):
     FakeSession.send_failures = 0
     FakeSession.drop_all = False
     monkeypatch.setattr(agent, "GatewaySession", FakeSession)
+    monkeypatch.setattr(agent, "RETRY_S", 0.05)
     monkeypatch.setenv("VLMRUN_API_KEY", "test-key")
 
 
@@ -96,6 +97,17 @@ async def run_loop(vision: agent.VisionAgent):
     return asyncio.create_task(vision._analysis_loop())
 
 
+def camera(vision: agent.VisionAgent, interval: float = 0.03) -> asyncio.Task:
+    """Pushes a new frame every ``interval`` seconds, like a live camera."""
+
+    async def feed() -> None:
+        while True:
+            vision.push(rgb_frame())
+            await asyncio.sleep(interval)
+
+    return asyncio.create_task(feed())
+
+
 async def stop(task: asyncio.Task) -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -109,10 +121,11 @@ def sent_count() -> int:
 async def test_result_is_published_on_the_vision_topic():
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    feed = camera(vision)
     task = await run_loop(vision)
     await wait_for(lambda: bool(room.local_participant.texts))
     await stop(task)
+    feed.cancel()
 
     topic, text = room.local_participant.texts[0]
     assert topic == "vision"
@@ -127,7 +140,7 @@ async def test_result_is_published_on_the_vision_topic():
 async def test_frames_are_sent_as_jpeg():
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    feed = camera(vision)
     task = await run_loop(vision)
     await wait_for(lambda: sent_count() >= 1)
     await stop(task)
@@ -149,7 +162,7 @@ async def test_dropped_frames_publish_nothing():
     FakeSession.drop_all = True
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    feed = camera(vision)
     task = await run_loop(vision)
     await wait_for(lambda: sent_count() >= 2)
     await stop(task)
@@ -161,7 +174,7 @@ async def test_a_failed_frame_closes_the_session_and_reconnects():
     FakeSession.send_failures = 1
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    feed = camera(vision)
     task = await run_loop(vision)
     await wait_for(lambda: bool(room.local_participant.texts))
     await stop(task)
@@ -174,7 +187,7 @@ async def test_a_failed_open_is_retried():
     FakeSession.open_failures = 1
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    feed = camera(vision)
     task = await run_loop(vision)
     await wait_for(lambda: bool(room.local_participant.texts))
     await stop(task)
@@ -200,13 +213,10 @@ def test_narrow_frames_keep_their_size():
     assert image.size == (640, 480)
 
 
-# Known gaps. Each test states the behavior the realtime socket's billing asks for
-# ("billed for the seconds it stays open"; "open one socket when the participant
-# publishes a camera and close it when they leave"). strict=True makes a fix show up as
-# XPASS, so the marker gets removed when the gap is closed.
+# The gateway bills the seconds a session is open: "open one socket when the participant
+# publishes a camera and close it when they leave".
 
 
-@pytest.mark.xfail(strict=True, reason="opens a billed session before any camera is published")
 async def test_no_session_until_a_camera_frame_arrives():
     task = await run_loop(agent.VisionAgent(FakeRoom()))  # type: ignore[arg-type]
     await asyncio.sleep(0.3)
@@ -214,28 +224,90 @@ async def test_no_session_until_a_camera_frame_arrives():
     assert FakeSession.instances == []
 
 
-@pytest.mark.xfail(strict=True, reason="keeps re-sending the last frame after the camera leaves")
-async def test_sending_stops_when_the_camera_leaves():
+async def test_session_closes_when_the_camera_leaves():
     room = FakeRoom()
     vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    room.handlers["track_unsubscribed"] = vision._on_track_gone
+    vision._track_sid = "cam"
+    feed = camera(vision)
     task = await run_loop(vision)
-    await wait_for(lambda: sent_count() >= 1)
-    unsubscribed = room.handlers.get("track_unsubscribed")
-    if unsubscribed is not None:
-        unsubscribed(object(), object(), object())
+    await wait_for(lambda: sent_count() >= 2)
+    feed.cancel()
+    room.handlers["track_unsubscribed"](_Track("cam"), object(), object())
+    await wait_for(lambda: FakeSession.instances[-1].closed)
     before = sent_count()
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.3)
     await stop(task)
-    assert sent_count() == before, f"sent {sent_count() - before} frames after the camera left"
+    assert sent_count() == before, "nothing sent after the camera left"
 
 
-@pytest.mark.xfail(strict=True, reason="re-sends the same frame when no new frame has arrived")
+async def test_idle_camera_closes_the_session_and_a_new_frame_reopens_it(monkeypatch):
+    monkeypatch.setattr(agent, "IDLE_CLOSE_S", 0.2)
+    vision = agent.VisionAgent(FakeRoom())  # type: ignore[arg-type]
+    task = await run_loop(vision)
+    vision.push(rgb_frame())
+    await wait_for(lambda: sent_count() == 1)
+    await wait_for(lambda: FakeSession.instances[0].closed, timeout=2.0)
+    vision.push(rgb_frame())
+    await wait_for(lambda: sent_count() == 2)
+    await stop(task)
+    assert len(FakeSession.instances) == 2
+
+
 async def test_a_frame_is_sent_once():
-    room = FakeRoom()
-    vision = agent.VisionAgent(room)  # type: ignore[arg-type]
-    vision.latest = rgb_frame()
+    vision = agent.VisionAgent(FakeRoom())  # type: ignore[arg-type]
+    vision.push(rgb_frame())
     task = await run_loop(vision)
     await asyncio.sleep(0.6)
     await stop(task)
     assert sent_count() == 1, f"one frame was sent {sent_count()} times"
+
+
+async def test_only_the_newest_frame_is_sent():
+    vision = agent.VisionAgent(FakeRoom())  # type: ignore[arg-type]
+    first, newest = rgb_frame(64, 48), rgb_frame(96, 48)
+    vision.push(first)
+    vision.push(newest)
+    task = await run_loop(vision)
+    await wait_for(lambda: sent_count() == 1)
+    await asyncio.sleep(0.2)
+    await stop(task)
+    image = Image.open(io.BytesIO(FakeSession.instances[0].sent[0]))
+    assert sent_count() == 1 and image.size == (96, 48)
+
+
+def test_frames_in_other_formats_are_converted():
+    i420 = rtc.VideoFrame(64, 48, rtc.VideoBufferType.I420, bytes(64 * 48 * 3 // 2))
+    assert Image.open(io.BytesIO(agent._jpeg(i420))).size == (64, 48)
+
+
+class _Track:
+    def __init__(self, sid: str) -> None:
+        self.sid = sid
+
+
+async def test_failed_opens_back_off(monkeypatch):
+    """A model at capacity must not be hammered: waits double up to MAX_RETRY_S."""
+    waits: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+        await real_sleep(0)
+
+    FakeSession.open_failures = 5
+    monkeypatch.setattr(agent, "RETRY_S", 1.0)
+    monkeypatch.setattr(agent, "MAX_RETRY_S", 4.0)
+    monkeypatch.setattr(agent.asyncio, "sleep", record)
+    vision = agent.VisionAgent(FakeRoom())  # type: ignore[arg-type]
+    for _ in range(8):
+        vision.push(rgb_frame())
+    task = asyncio.create_task(vision._analysis_loop())
+    for _ in range(200):
+        if len(FakeSession.instances) >= 6:
+            break
+        vision.push(rgb_frame())
+        await real_sleep(0.005)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert waits[:5] == [1.0, 2.0, 4.0, 4.0, 4.0], waits

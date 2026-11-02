@@ -98,6 +98,11 @@ async def main() -> int:
         await asyncio.sleep(2)
         phase = "blank"
         await asyncio.sleep(8)
+        # The camera leaves while the agent keeps running: the billed session must close.
+        phase = "gone"
+        publisher.cancel()
+        await camera.local_participant.unpublish_track(track.sid)
+        await asyncio.sleep(8)
     finally:
         agent.terminate()
         try:
@@ -126,6 +131,13 @@ async def main() -> int:
         check("observation carries timing", "latency_ms" in meta and "gateway_ms" in meta, json.dumps(meta))
 
     agent_log = Path("/tmp/agent.log").read_text(errors="replace")
+    check(
+        "session closes when the camera leaves",
+        "closing gateway session" in agent_log,
+        "agent log shows the close" if "closing gateway session" in agent_log else "no close in log",
+    )
+    after_leave = [o for ph, o in observations if ph == "gone"]
+    check("nothing published after the camera left", len(after_leave) <= 1, f"n={len(after_leave)}")
     errors = [line for line in agent_log.splitlines() if "frame failed" in line or "Exception" in line]
     check("agent log has no frame errors", not errors, " | ".join(errors[:3])[:300])
     print("--- agent log tail ---")
