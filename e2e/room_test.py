@@ -53,11 +53,14 @@ async def main() -> int:
     room_name = f"lva-e2e-{uuid.uuid4().hex[:8]}"
     camera = rtc.Room()
     observations: list[tuple[str, dict]] = []
+    arrived: list[float] = []
+    left_at = 0.0
     phase = "warmup"
     tasks: set[asyncio.Task] = set()
 
     async def read(reader: rtc.TextStreamReader) -> None:
         observations.append((phase, json.loads(await reader.read_all())))
+        arrived.append(time.monotonic())
 
     def on_text(reader: rtc.TextStreamReader, identity: str) -> None:
         task = asyncio.create_task(read(reader))
@@ -102,6 +105,7 @@ async def main() -> int:
         phase = "gone"
         publisher.cancel()
         await camera.local_participant.unpublish_track(track.sid)
+        left_at = time.monotonic()
         await asyncio.sleep(8)
     finally:
         agent.terminate()
@@ -136,8 +140,14 @@ async def main() -> int:
         "closing gateway session" in agent_log,
         "agent log shows the close" if "closing gateway session" in agent_log else "no close in log",
     )
-    after_leave = [o for ph, o in observations if ph == "gone"]
-    check("nothing published after the camera left", len(after_leave) <= 1, f"n={len(after_leave)}")
+    # Frames already in flight when the camera leaves may still be answered; after that
+    # (2 s covers LiveKit's unsubscribe delay) nothing more may arrive.
+    late = [t - left_at for t in arrived if left_at and t > left_at + 2.0]
+    check(
+        "nothing published 2 s after the camera left",
+        not late,
+        f"in-flight after leave={sum(1 for t in arrived if left_at and t > left_at)} late={len(late)}",
+    )
     errors = [line for line in agent_log.splitlines() if "frame failed" in line or "Exception" in line]
     check("agent log has no frame errors", not errors, " | ".join(errors[:3])[:300])
     print("--- agent log tail ---")
