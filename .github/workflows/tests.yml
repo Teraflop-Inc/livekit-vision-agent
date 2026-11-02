@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --extra dev
+      - run: uv run pytest -q -rxX
+
+  # Real LiveKit room against the live VLM Run socket. Runs only where the secrets exist.
+  room:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+      LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+      LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+      VLMRUN_API_KEY: ${{ secrets.VLMRUN_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.VLMRUN_API_KEY != ''
+      - uses: astral-sh/setup-uv@v6
+        if: env.VLMRUN_API_KEY != ''
+      - run: uv sync --extra dev
+        if: env.VLMRUN_API_KEY != ''
+      - run: uv run python e2e/room_test.py
+        if: env.VLMRUN_API_KEY != ''
+      - name: Live gateway test
+        if: env.VLMRUN_API_KEY != ''
+        run: uv run pytest -q tests/test_live_gateway.py
