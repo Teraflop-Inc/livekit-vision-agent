@@ -8,6 +8,7 @@ the session is already busy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -115,12 +116,20 @@ class GatewaySession:
             raise RuntimeError(f"expected session.created, got {created.get('type')}")
         self.max_fps = float(created.get("max_fps") or 0)
 
-    async def send_jpeg(self, jpeg: bytes) -> dict[str, Any] | None:
-        """Send one frame. ``None`` means the server dropped it."""
+    async def send_jpeg(self, jpeg: bytes, timeout: float = 5.0) -> dict[str, Any] | None:
+        """Send one frame. ``None`` means the server dropped it.
+
+        Raises ``TimeoutError`` when no reply arrives within ``timeout`` seconds; the
+        session should then be closed, since a late reply would answer the wrong frame.
+        """
         if self._ws is None:
             raise RuntimeError("session is not open")
         await self._ws.send(jpeg)
-        event = json.loads(await self._ws.recv())
+        try:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"no reply for the frame within {timeout:g}s") from None
+        event = json.loads(raw)
         kind = event.get("type")
         if kind == "frame.dropped":
             return None

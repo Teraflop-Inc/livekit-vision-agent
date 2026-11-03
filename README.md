@@ -2,9 +2,16 @@
 
 A [LiveKit Agents](https://docs.livekit.io/agents/) worker that joins a room, watches the camera or screen that was published there, and posts what the model sees back into the room as JSON.
 
-Inference goes to the VLM Run realtime socket, `wss://gateway.vlm.run/v1/ws`. One session stays open. Each message after it opens is a single JPEG, sent as raw bytes, and the reply is the model's result for that frame.
+Inference goes to the VLM Run realtime socket, `wss://gateway.vlm.run/v1/ws`. Each message after the session opens is a single JPEG, sent as raw bytes, and the reply is the model's result for that frame. The gateway bills the seconds a session is open, so the session opens on the first camera frame and closes when the camera leaves or sends no new frame for 5 seconds.
 
 The page shows your camera immediately. The JSON panel updates when each result arrives, with the round-trip on the first line.
+
+## Test it
+
+```bash
+uv run pytest                    # unit tests; live socket tests run when VLMRUN_API_KEY is set
+uv run python e2e/room_test.py   # a real LiveKit room; needs the LiveKit and VLM Run keys
+```
 
 ## Run it
 
