@@ -19,7 +19,23 @@
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   .panel { background: #10131b; border: 1px solid #1d2230; border-radius: 12px; overflow: hidden; }
   .panel h2 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #8b93a7; margin: 0; padding: 12px 16px; border-bottom: 1px solid #1d2230; }
-  video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; object-fit: contain; }
+  .stage { position: relative; background: #000; aspect-ratio: 16/9; }
+  #view { width: 100%; height: 100%; display: none; object-fit: contain; background: #000; }
+  .stage.matched #view { display: block; }
+  .pip { width: 100%; height: 100%; }
+  .pip video { width: 100%; height: 100%; background: #000; display: block; object-fit: contain; }
+  .pip span { display: none; }
+  .stage.matched .pip {
+    position: absolute; right: 12px; bottom: 12px; width: 26%; height: auto;
+    border-radius: 8px; overflow: hidden; border: 1px solid #2a3144;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+  }
+  .stage.matched .pip video { aspect-ratio: 16/9; object-fit: cover; }
+  .stage.matched .pip span {
+    display: block; position: absolute; left: 8px; bottom: 8px;
+    font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: #e8eaf0;
+    background: rgba(11, 13, 18, .72); border-radius: 4px; padding: 2px 6px;
+  }
   .controls { padding: 14px 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   button {
     background: #2450ff; color: #fff; border: 0; border-radius: 8px; padding: 9px 16px;
@@ -27,6 +43,11 @@
   }
   button.secondary { background: #1d2230; }
   button:disabled { opacity: .45; cursor: default; }
+  select, input {
+    background: #1d2230; color: #e8eaf0; border: 0; border-radius: 8px;
+    padding: 9px 12px; font-size: 14px;
+  }
+  input { width: 140px; }
   #status { font-size: 13px; color: #8b93a7; margin-left: auto; }
   #latest {
     margin: 0; padding: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
@@ -43,12 +64,25 @@
 </header>
 <main>
   <section class="panel">
-    <h2>Video source</h2>
-    <video id="preview" autoplay muted playsinline></video>
+    <h2>Model frame</h2>
+    <div class="stage" id="stage">
+      <canvas id="view"></canvas>
+      <div class="pip">
+        <video id="preview" autoplay muted playsinline></video>
+        <span>live</span>
+      </div>
+    </div>
     <div class="controls">
       <button id="camBtn">Share camera</button>
       <button id="screenBtn" class="secondary">Share screen</button>
       <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <select id="model">
+        <option value="usyd-community/vitpose-plus-large" data-method="pose">ViTPose+</option>
+        <option value="geopavlakos/hamer" data-method="pose">HaMeR</option>
+        <option value="facebook/sam3.1" data-method="segment">SAM 3.1</option>
+        <option value="paddleocr/pp-ocrv6" data-method="ocr">PP-OCRv6</option>
+      </select>
+      <input id="prompt" placeholder="prompt">
       <span id="status">disconnected</span>
     </div>
   </section>
@@ -65,12 +99,168 @@ const statusEl = document.getElementById("status");
 const latestEl = document.getElementById("latest");
 const logEl = document.getElementById("log");
 const preview = document.getElementById("preview");
+const view = document.getElementById("view");
+const stage = document.getElementById("stage");
 const camBtn = document.getElementById("camBtn");
 const screenBtn = document.getElementById("screenBtn");
 const stopBtn = document.getElementById("stopBtn");
+const modelSelect = document.getElementById("model");
+const promptInput = document.getElementById("prompt");
+
+// COCO 17: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles.
+const BONES = [[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];
+const HAND_BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20]];
+const PERSON_COLORS = ["#7ee787", "#79c0ff", "#ffa657", "#d2a8ff", "#ff7b72"];
 
 let room = null;
 let publishedTrack = null;
+const frames = new Map();
+const poses = new Map();
+let shown = -1;
+
+function usesPixels(items) {
+  for (const person of items) {
+    const pts = person.kpts_xy || [];
+    for (const pt of pts) {
+      if (pt && (pt[0] > 1.5 || pt[1] > 1.5)) return true;
+    }
+  }
+  return false;
+}
+
+function paintPose(ctx, body, width, height) {
+  const items = Array.isArray(body.items) ? body.items : [];
+  const pixels = usesPixels(items);
+  const point = (pt) => pixels ? [pt[0], pt[1]] : [pt[0] * width, pt[1] * height];
+  items.forEach((person, index) => {
+    const color = PERSON_COLORS[index % PERSON_COLORS.length];
+    const box = person.bbox_xywh;
+    if (box && box.length >= 4) {
+      const [x, y] = point([box[0], box[1]]);
+      const [r, b] = point([box[0] + box[2], box[1] + box[3]]);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, y, r - x, b - y);
+    }
+    const poly = person.poly_xy;
+    if (Array.isArray(poly) && poly.length >= 2) {
+      ctx.beginPath();
+      poly.forEach((pt, i) => {
+        const [x, y] = point(pt);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    const caption = person.text || (person.label && person.label !== "person" ? person.label : "");
+    if (caption && box && box.length >= 4) {
+      const [x, y] = point([box[0], box[1]]);
+      ctx.font = "16px ui-sans-serif, system-ui, sans-serif";
+      ctx.fillStyle = color;
+      ctx.fillText(String(caption), x + 4, Math.max(18, y - 6));
+    }
+    const pts = person.kpts_xy || [];
+    const scores = person.kpts_score || [];
+    const visible = (i) => pts[i] && (scores[i] == null || scores[i] >= 0.3);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = color;
+    ctx.lineCap = "round";
+    const bones = pts.length >= 21 ? HAND_BONES : BONES;
+    for (const [a, b] of bones) {
+      if (!visible(a) || !visible(b)) continue;
+      const [x1, y1] = point(pts[a]);
+      const [x2, y2] = point(pts[b]);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    pts.forEach((pt, i) => {
+      if (!visible(i)) return;
+      const [x, y] = point(pt);
+      ctx.beginPath();
+      ctx.fillStyle = "#0b0d12";
+      ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.fillStyle = color;
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+  const latency = body._vlmrun && body._vlmrun.latency_ms;
+  if (latency != null) {
+    const model = (body._vlmrun && body._vlmrun.model) || "";
+    const short = model.split("/").pop() || "model";
+    const label = short + " · " + items.length + " · " + latency + " ms";
+    ctx.font = "13px ui-sans-serif, system-ui, sans-serif";
+    const pad = 8;
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = "rgba(11, 13, 18, 0.72)";
+    ctx.fillRect(10, 10, tw + pad * 2, 24);
+    ctx.fillStyle = "#e8eaf0";
+    ctx.fillText(label, 10 + pad, 26);
+  }
+}
+
+function dropOlder(id) {
+  for (const key of [...frames.keys()]) {
+    if (Number(key) < id) {
+      const bitmap = frames.get(key);
+      if (bitmap && bitmap.close) bitmap.close();
+      frames.delete(key);
+    }
+  }
+  for (const key of [...poses.keys()]) {
+    if (Number(key) < id) poses.delete(key);
+  }
+}
+
+function showPair(id) {
+  const bitmap = frames.get(id);
+  const body = poses.get(id);
+  if (!bitmap || !body || Number(id) < shown) return;
+  shown = Number(id);
+  if (view.width !== bitmap.width || view.height !== bitmap.height) {
+    view.width = bitmap.width;
+    view.height = bitmap.height;
+  }
+  const ctx = view.getContext("2d");
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(bitmap, 0, 0);
+  paintPose(ctx, body, bitmap.width, bitmap.height);
+  stage.classList.add("matched");
+  dropOlder(shown);
+}
+
+async function readBytes(reader) {
+  if (typeof reader.readAll === "function") {
+    const data = await reader.readAll();
+    if (data instanceof Uint8Array) return data;
+    const parts = Array.isArray(data) ? data : [];
+    const size = parts.reduce((n, chunk) => n + chunk.byteLength, 0);
+    const out = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of parts) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out;
+  }
+  const parts = [];
+  for await (const chunk of reader) parts.push(chunk);
+  const size = parts.reduce((n, chunk) => n + chunk.byteLength, 0);
+  const out = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of parts) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
 
 async function connect() {
   if (room) return room;
@@ -78,6 +268,17 @@ async function connect() {
   if (!res.ok) throw new Error("token failed (" + res.status + ")");
   const { url, token } = await res.json();
   room = new Room({ adaptiveStream: false, dynacast: false });
+  room.registerByteStreamHandler("frame", async (reader) => {
+    const info = reader.info || {};
+    const id = String((info.attributes && info.attributes.frame) || info.name || "");
+    if (!id || (shown >= 0 && Number(id) < shown)) return;
+    const bytes = await readBytes(reader);
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+    const previous = frames.get(id);
+    if (previous && previous.close) previous.close();
+    frames.set(id, bitmap);
+    showPair(id);
+  });
   room.registerTextStreamHandler("vision", async (reader) => {
     const text = await reader.readAll();
     let pretty = text;
@@ -86,6 +287,11 @@ async function connect() {
       const body = JSON.parse(text);
       latency = body._vlmrun && body._vlmrun.latency_ms != null ? body._vlmrun.latency_ms + " ms" : "";
       pretty = JSON.stringify(body, null, 2);
+      const id = String(body._vlmrun && body._vlmrun.seq != null ? body._vlmrun.seq : "");
+      if (id && !(shown >= 0 && Number(id) < shown)) {
+        poses.set(id, body);
+        showPair(id);
+      }
     } catch (err) {}
     latestEl.textContent = latency ? latency + "\n\n" + pretty : pretty;
     const entry = document.createElement("div");
@@ -121,7 +327,8 @@ async function publish(kind) {
       scalabilityMode: "L1T1",
     });
     publishedTrack.attach(preview);
-    statusEl.textContent = "publishing " + kind + " · " + connected.name;
+    await publishConfig();
+    statusEl.textContent = "publishing " + kind + " · " + modelSelect.value;
     stopBtn.disabled = false;
   } catch (err) {
     statusEl.textContent = "error: " + (err.message || err);
@@ -139,9 +346,34 @@ async function stopTrack() {
   stopBtn.disabled = true;
 }
 
+function selectedModel() {
+  const option = modelSelect.selectedOptions[0];
+  const method = option ? option.dataset.method : "pose";
+  let prompt = promptInput.value.trim();
+  if (method === "segment" && !prompt) {
+    prompt = "face";
+    promptInput.value = prompt;
+  }
+  return { model: modelSelect.value, method, prompt };
+}
+
+async function publishConfig() {
+  if (!room || room.state !== "connected") return;
+  const choice = selectedModel();
+  shown = -1;
+  for (const bitmap of frames.values()) if (bitmap && bitmap.close) bitmap.close();
+  frames.clear();
+  poses.clear();
+  stage.classList.remove("matched");
+  await room.localParticipant.sendText(JSON.stringify(choice), { topic: "control" });
+  statusEl.textContent = "publishing · " + choice.model;
+}
+
 camBtn.onclick = () => publish("camera");
 screenBtn.onclick = () => publish("screen");
 stopBtn.onclick = () => { stopTrack(); statusEl.textContent = "connected · " + (room ? room.name : ""); };
+modelSelect.onchange = () => publishConfig();
+promptInput.onchange = () => publishConfig();
 </script>
 </body>
 </html>

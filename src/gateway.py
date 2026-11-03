@@ -74,12 +74,21 @@ def observation(event: dict[str, Any], *, model: str, latency_ms: int) -> dict[s
 class GatewaySession:
     """A single open ``WS /v1/ws`` session."""
 
-    def __init__(self, url: str, api_key: str, model: str, method: str = "", prompt: str = "") -> None:
+    def __init__(
+        self,
+        url: str,
+        api_key: str,
+        model: str,
+        method: str = "",
+        prompt: str = "",
+        method_params: dict[str, Any] | None = None,
+    ) -> None:
         self.url = url
         self.api_key = api_key
         self.model = model
         self.method = method
         self.prompt = prompt
+        self.method_params = method_params or {}
         self.max_fps = 0.0
         self._ws: Any = None
 
@@ -95,6 +104,8 @@ class GatewaySession:
             opening["method"] = self.method
         if self.prompt:
             opening["prompt"] = self.prompt
+        if self.method_params:
+            opening["method_params"] = self.method_params
         await self._ws.send(json.dumps(opening))
         created = json.loads(await self._ws.recv())
         if created.get("type") == "error":
@@ -121,10 +132,15 @@ class GatewaySession:
         return event
 
     async def aclose(self) -> None:
-        if self._ws is None:
+        ws = self._ws
+        self._ws = None
+        if ws is None:
             return
         try:
-            await self._ws.send(json.dumps({"type": "session.close"}))
-        finally:
-            await self._ws.close()
-            self._ws = None
+            await ws.send(json.dumps({"type": "session.close"}))
+        except Exception:
+            pass
+        try:
+            await ws.close()
+        except Exception:
+            pass
